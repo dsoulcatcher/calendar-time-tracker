@@ -5,12 +5,16 @@ const readline = require('readline');
 const tough = require('tough-cookie');
 const chalk = require('chalk').default || require('chalk');
 const moment = require('moment-timezone');
+const fs = require('fs');
+const path = require('path');
+
 
 // Configuration
 const TIME_TRACKER_API = 'https://watcher.redmadrobot.com/api/v2/logged-time/';
 const LOGIN_API = 'https://watcher.redmadrobot.com/api/v2/auth/login';
 const PROJECT_ID = 1554;
 const TIME_ZONE = 'Asia/Almaty';
+const ENV_PATH = path.resolve(__dirname, '.env');
 
 // Initialize Google Calendar API
 const oauth2Client = new google.auth.OAuth2(
@@ -86,6 +90,76 @@ function isValidDate(dateStr) {
   if (!regex.test(dateStr)) return false;
   const date = moment(dateStr, 'YYYY-MM-DD', true);
   return date.isValid();
+}
+
+// Function to check if the refresh token is valid
+async function isRefreshTokenValid() {
+  try {
+    // Try a simple API call
+    await calendar.events.list({
+      calendarId: 'primary',
+      maxResults: 1
+    });
+    return true;
+  } catch (err) {
+    if (
+      err.code === 401 ||
+      err.code === 400 ||
+      (err.errors && err.errors.some(e => e.reason === 'invalidGrant')) ||
+      (err.response && err.response.data && err.response.data.error === 'invalid_grant')
+    ) {
+      return false;
+    }
+    // For other errors, assume valid (fail open)
+    return true;
+  }
+}
+
+// Function to run OAuth flow and update .env
+async function updateRefreshTokenFlow() {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/calendar.readonly']
+  });
+  console.log(chalk.yellow('\nAuthorize this app by visiting this URL:'), url);
+
+  return new Promise((resolve) => {
+    rl.question('Enter the code from that page here: ', (code) => {
+      oauth2Client.getToken(code, (err, tokens) => {
+        if (err) {
+          console.error(chalk.red('Error retrieving tokens:'), err);
+          process.exit(1);
+        }
+        const refreshToken = tokens.refresh_token;
+        if (!refreshToken) {
+          console.error(chalk.red('No refresh token received. Make sure to remove any previous consent for this app in your Google Account and try again.'));
+          process.exit(1);
+        }
+        // Read and update the .env file
+        let envContent = '';
+        try {
+          envContent = fs.readFileSync(ENV_PATH, 'utf8');
+        } catch (readErr) {
+          console.error(chalk.red('Failed to read .env file:'), readErr);
+          process.exit(1);
+        }
+        const updatedContent = envContent.includes('REFRESH_TOKEN=')
+          ? envContent.replace(/REFRESH_TOKEN=.*/g, `REFRESH_TOKEN=${refreshToken}`)
+          : `${envContent.trim()}\nREFRESH_TOKEN=${refreshToken}\n`;
+        try {
+          fs.writeFileSync(ENV_PATH, updatedContent, 'utf8');
+          console.log(chalk.green('.env file updated with new REFRESH_TOKEN'));
+        } catch (writeErr) {
+          console.error(chalk.red('Failed to write to .env file:'), writeErr);
+          process.exit(1);
+        }
+        // Update process.env and oauth2Client
+        process.env.REFRESH_TOKEN = refreshToken;
+        oauth2Client.setCredentials({ refresh_token: refreshToken });
+        resolve();
+      });
+    });
+  });
 }
 
 // Log time to the time tracker
@@ -198,35 +272,54 @@ async function syncCalendarToTimeTracker(startDate, endDate) {
   }
 }
 
-// Prompt user for mode
-rl.question(chalk.bold('Do you want to log for a specific day or a period? Choose from:\n1) day\n2) period\n'), (mode) => {
-  if (mode.toLowerCase() === '1') {
-    rl.question(chalk.bold('Enter the date to process (YYYY-MM-DD): '), (dateInput) => {
-      if (!isValidDate(dateInput)) {
-        console.error(chalk.red('Invalid date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
-        rl.close();
-        return;
-      }
-      syncCalendarToTimeTracker(dateInput, dateInput);
+// At the start, check refresh token validity
+(async () => {
+  const valid = await isRefreshTokenValid();
+  if (!valid) {
+    console.log(chalk.red('\nYour Google refresh token is invalid or expired.'));
+    await new Promise((resolve) => {
+      rl.question(chalk.yellow('Do you want to update the refresh token now? (y/n): '), async (answer) => {
+        if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
+          await updateRefreshTokenFlow();
+          resolve();
+        } else {
+          console.log(chalk.red('Exiting. You must have a valid refresh token to continue.'));
+          rl.close();
+          process.exit(0);
+        }
+      });
     });
-  } else if (mode.toLowerCase() === '2') {
-    rl.question(chalk.bold('Enter the start date (YYYY-MM-DD): '), (startDate) => {
-      if (!isValidDate(startDate)) {
-        console.error(chalk.red('Invalid start date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
-        rl.close();
-        return;
-      }
-      rl.question(chalk.bold('Enter the end date (YYYY-MM-DD): '), (endDate) => {
-        if (!isValidDate(endDate)) {
-          console.error(chalk.red('Invalid end date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
+  }
+  // Continue with the rest of the script
+  rl.question(chalk.bold('Do you want to log for a specific day or a period? Choose from:\n1) day\n2) period\n'), (mode) => {
+    if (mode.toLowerCase() === '1') {
+      rl.question(chalk.bold('Enter the date to process (YYYY-MM-DD): '), (dateInput) => {
+        if (!isValidDate(dateInput)) {
+          console.error(chalk.red('Invalid date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
           rl.close();
           return;
         }
-        syncCalendarToTimeTracker(startDate, endDate);
+        syncCalendarToTimeTracker(dateInput, dateInput);
       });
-    });
-  } else {
-    console.error(chalk.red('Invalid option. Please enter "1" for day or "2" for period.'));
-    rl.close();
-  }
-});
+    } else if (mode.toLowerCase() === '2') {
+      rl.question(chalk.bold('Enter the start date (YYYY-MM-DD): '), (startDate) => {
+        if (!isValidDate(startDate)) {
+          console.error(chalk.red('Invalid start date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
+          rl.close();
+          return;
+        }
+        rl.question(chalk.bold('Enter the end date (YYYY-MM-DD): '), (endDate) => {
+          if (!isValidDate(endDate)) {
+            console.error(chalk.red('Invalid end date format. Please use YYYY-MM-DD (e.g., 2025-05-30).'));
+            rl.close();
+            return;
+          }
+          syncCalendarToTimeTracker(startDate, endDate);
+        });
+      });
+    } else {
+      console.error(chalk.red('Invalid option. Please enter "1" for day or "2" for period.'));
+      rl.close();
+    }
+  });
+})();
