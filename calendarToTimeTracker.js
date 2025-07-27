@@ -94,6 +94,9 @@ function isValidDate(dateStr) {
 
 // Function to check if the refresh token is valid
 async function isRefreshTokenValid() {
+  if (!process.env.REFRESH_TOKEN || process.env.REFRESH_TOKEN.trim() === '') {
+    return false;
+  }
   try {
     // Try a simple API call
     await calendar.events.list({
@@ -153,9 +156,9 @@ async function updateRefreshTokenFlow() {
           console.error(chalk.red('Failed to write to .env file:'), writeErr);
           process.exit(1);
         }
-        // Update process.env and oauth2Client
-        process.env.REFRESH_TOKEN = refreshToken;
-        oauth2Client.setCredentials({ refresh_token: refreshToken });
+        // Reload .env and re-initialize oauth2Client
+        require('dotenv').config();
+        oauth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
         resolve();
       });
     });
