@@ -7,6 +7,7 @@ const chalk = require('chalk').default || require('chalk');
 const moment = require('moment-timezone');
 const fs = require('fs');
 const path = require('path');
+const { getNewRefreshToken } = require('./getRefreshToken');
 
 
 // Configuration
@@ -109,60 +110,16 @@ async function isRefreshTokenValid() {
       err.code === 401 ||
       err.code === 400 ||
       (err.errors && err.errors.some(e => e.reason === 'invalidGrant')) ||
-      (err.response && err.response.data && err.response.data.error === 'invalid_grant')
+      (err.response && err.response.data && (
+        err.response.data.error === 'invalid_grant' ||
+        err.response.data.error === 'unauthorized_client'
+      ))
     ) {
       return false;
     }
     // For other errors, assume valid (fail open)
     return true;
   }
-}
-
-// Function to run OAuth flow and update .env
-async function updateRefreshTokenFlow() {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/calendar.readonly']
-  });
-  console.log(chalk.yellow('\nAuthorize this app by visiting this URL:'), url);
-
-  return new Promise((resolve) => {
-    rl.question('Enter the code from that page here: ', (code) => {
-      oauth2Client.getToken(code, (err, tokens) => {
-        if (err) {
-          console.error(chalk.red('Error retrieving tokens:'), err);
-          process.exit(1);
-        }
-        const refreshToken = tokens.refresh_token;
-        if (!refreshToken) {
-          console.error(chalk.red('No refresh token received. Make sure to remove any previous consent for this app in your Google Account and try again.'));
-          process.exit(1);
-        }
-        // Read and update the .env file
-        let envContent = '';
-        try {
-          envContent = fs.readFileSync(ENV_PATH, 'utf8');
-        } catch (readErr) {
-          console.error(chalk.red('Failed to read .env file:'), readErr);
-          process.exit(1);
-        }
-        const updatedContent = envContent.includes('REFRESH_TOKEN=')
-          ? envContent.replace(/REFRESH_TOKEN=.*/g, `REFRESH_TOKEN=${refreshToken}`)
-          : `${envContent.trim()}\nREFRESH_TOKEN=${refreshToken}\n`;
-        try {
-          fs.writeFileSync(ENV_PATH, updatedContent, 'utf8');
-          console.log(chalk.green('.env file updated with new REFRESH_TOKEN'));
-        } catch (writeErr) {
-          console.error(chalk.red('Failed to write to .env file:'), writeErr);
-          process.exit(1);
-        }
-        // Reload .env and re-initialize oauth2Client
-        require('dotenv').config();
-        oauth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
-        resolve();
-      });
-    });
-  });
 }
 
 // Log time to the time tracker
@@ -277,23 +234,40 @@ async function syncCalendarToTimeTracker(startDate, endDate) {
 
 // At the start, check refresh token validity
 (async () => {
+  await new Promise((resolve) => {
+    rl.question('Do you want to update your Google refresh token before starting? (y/n): ', async (answer) => {
+      if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
+        await getNewRefreshToken(rl);
+        require('dotenv').config();
+        oauth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
+      }
+      resolve();
+    });
+  });
   const valid = await isRefreshTokenValid();
   if (!valid) {
     console.log(chalk.red('\nYour Google refresh token is invalid or expired.'));
     await new Promise((resolve) => {
       rl.question(chalk.yellow('Do you want to update the refresh token now? (y/n): '), async (answer) => {
         if (answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes') {
-          await updateRefreshTokenFlow();
-          resolve();
+          await getNewRefreshToken(rl);
+          require('dotenv').config();
+          oauth2Client.setCredentials({ refresh_token: process.env.REFRESH_TOKEN });
         } else {
-          console.log(chalk.red('Exiting. You must have a valid refresh token to continue.'));
+          console.log(chalk.red('\nExiting. You must have a valid refresh token to continue.'));
           rl.close();
           process.exit(0);
         }
+        resolve();
       });
     });
   }
-  // Continue with the rest of the script
+  // Time Tracker Flow Section
+  console.log('\n==============================');
+  console.log('Time Tracker Logging Flow');
+  console.log('==============================');
+  console.log('\nYou can now log your Google Calendar events to the Time Tracker.');
+  console.log('Follow the prompts below to select a day or period.');
   rl.question(chalk.bold('Do you want to log for a specific day or a period? Choose from:\n1) day\n2) period\n'), (mode) => {
     if (mode.toLowerCase() === '1') {
       rl.question(chalk.bold('Enter the date to process (YYYY-MM-DD): '), (dateInput) => {
